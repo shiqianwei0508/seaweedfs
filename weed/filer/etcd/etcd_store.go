@@ -1,18 +1,20 @@
 package etcd
 
 import (
-	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"strings"
 	"time"
 
-	"go.etcd.io/etcd/clientv3"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
 
-	"github.com/chrislusf/seaweedfs/weed/filer"
-	"github.com/chrislusf/seaweedfs/weed/glog"
-	"github.com/chrislusf/seaweedfs/weed/pb/filer_pb"
-	weed_util "github.com/chrislusf/seaweedfs/weed/util"
+	clientv3 "go.etcd.io/etcd/client/v3"
+
+	"github.com/seaweedfs/seaweedfs/weed/filer"
+	"github.com/seaweedfs/seaweedfs/weed/glog"
+	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
+	weed_util "github.com/seaweedfs/seaweedfs/weed/util"
 )
 
 const (
@@ -24,44 +26,80 @@ func init() {
 }
 
 type EtcdStore struct {
-	client *clientv3.Client
+	client        *clientv3.Client
+	etcdKeyPrefix string
+	timeout       time.Duration
 }
 
 func (store *EtcdStore) GetName() string {
 	return "etcd"
 }
 
-func (store *EtcdStore) Initialize(configuration weed_util.Configuration, prefix string) (err error) {
+func (store *EtcdStore) Initialize(configuration weed_util.Configuration, prefix string) error {
+	configuration.SetDefault(prefix+"servers", "localhost:2379")
+	configuration.SetDefault(prefix+"timeout", "3s")
+
 	servers := configuration.GetString(prefix + "servers")
-	if servers == "" {
-		servers = "localhost:2379"
+
+	username := configuration.GetString(prefix + "username")
+	password := configuration.GetString(prefix + "password")
+	store.etcdKeyPrefix = configuration.GetString(prefix + "key_prefix")
+
+	timeoutStr := configuration.GetString(prefix + "timeout")
+	timeout, err := time.ParseDuration(timeoutStr)
+	if err != nil {
+		return fmt.Errorf("parse etcd store timeout: %w", err)
+	}
+	store.timeout = timeout
+
+	certFile := configuration.GetString(prefix + "tls_client_crt_file")
+	keyFile := configuration.GetString(prefix + "tls_client_key_file")
+	caFile := configuration.GetString(prefix + "tls_ca_file")
+
+	var tlsConfig *tls.Config
+	if caFile != "" {
+		tlsInfo := transport.TLSInfo{
+			CertFile:      certFile,
+			KeyFile:       keyFile,
+			TrustedCAFile: caFile,
+		}
+		var err error
+		tlsConfig, err = tlsInfo.ClientConfig()
+		if err != nil {
+			return fmt.Errorf("TLS client configuration error: %w", err)
+		}
 	}
 
-	timeout := configuration.GetString(prefix + "timeout")
-	if timeout == "" {
-		timeout = "3s"
-	}
-
-	return store.initialize(servers, timeout)
+	return store.initialize(servers, username, password, store.timeout, tlsConfig)
 }
 
-func (store *EtcdStore) initialize(servers string, timeout string) (err error) {
+func (store *EtcdStore) initialize(servers, username, password string, timeout time.Duration, tlsConfig *tls.Config) error {
 	glog.Infof("filer store etcd: %s", servers)
 
-	to, err := time.ParseDuration(timeout)
-	if err != nil {
-		return fmt.Errorf("parse timeout %s: %s", timeout, err)
-	}
-
-	store.client, err = clientv3.New(clientv3.Config{
+	client, err := clientv3.New(clientv3.Config{
 		Endpoints:   strings.Split(servers, ","),
-		DialTimeout: to,
+		Username:    username,
+		Password:    password,
+		DialTimeout: timeout,
+		TLS:         tlsConfig,
 	})
 	if err != nil {
 		return fmt.Errorf("connect to etcd %s: %s", servers, err)
 	}
 
-	return
+	ctx, cancel := context.WithTimeout(context.Background(), store.timeout)
+	defer cancel()
+
+	resp, err := client.Status(ctx, client.Endpoints()[0])
+	if err != nil {
+		client.Close()
+		return fmt.Errorf("error checking etcd connection: %s", err)
+	}
+
+	glog.V(0).InfofCtx(ctx, "сonnection to etcd has been successfully verified. etcd version: %s", resp.Version)
+	store.client = client
+
+	return nil
 }
 
 func (store *EtcdStore) BeginTransaction(ctx context.Context) (context.Context, error) {
@@ -82,11 +120,11 @@ func (store *EtcdStore) InsertEntry(ctx context.Context, entry *filer.Entry) (er
 		return fmt.Errorf("encoding %s %+v: %v", entry.FullPath, entry.Attr, err)
 	}
 
-	if len(entry.Chunks) > 50 {
+	if len(entry.GetChunks()) > filer.CountEntryChunksForGzip {
 		meta = weed_util.MaybeGzipData(meta)
 	}
 
-	if _, err := store.client.Put(ctx, string(key), string(meta)); err != nil {
+	if _, err := store.client.Put(ctx, store.etcdKeyPrefix+string(key), string(meta)); err != nil {
 		return fmt.Errorf("persisting %s : %v", entry.FullPath, err)
 	}
 
@@ -100,7 +138,7 @@ func (store *EtcdStore) UpdateEntry(ctx context.Context, entry *filer.Entry) (er
 func (store *EtcdStore) FindEntry(ctx context.Context, fullpath weed_util.FullPath) (entry *filer.Entry, err error) {
 	key := genKey(fullpath.DirAndName())
 
-	resp, err := store.client.Get(ctx, string(key))
+	resp, err := store.client.Get(ctx, store.etcdKeyPrefix+string(key), atScanRevision(ctx)...)
 	if err != nil {
 		return nil, fmt.Errorf("get %s : %v", fullpath, err)
 	}
@@ -123,7 +161,7 @@ func (store *EtcdStore) FindEntry(ctx context.Context, fullpath weed_util.FullPa
 func (store *EtcdStore) DeleteEntry(ctx context.Context, fullpath weed_util.FullPath) (err error) {
 	key := genKey(fullpath.DirAndName())
 
-	if _, err := store.client.Delete(ctx, string(key)); err != nil {
+	if _, err := store.client.Delete(ctx, store.etcdKeyPrefix+string(key)); err != nil {
 		return fmt.Errorf("delete %s : %v", fullpath, err)
 	}
 
@@ -133,7 +171,7 @@ func (store *EtcdStore) DeleteEntry(ctx context.Context, fullpath weed_util.Full
 func (store *EtcdStore) DeleteFolderChildren(ctx context.Context, fullpath weed_util.FullPath) (err error) {
 	directoryPrefix := genDirectoryKeyPrefix(fullpath, "")
 
-	if _, err := store.client.Delete(ctx, string(directoryPrefix), clientv3.WithPrefix()); err != nil {
+	if _, err := store.client.Delete(ctx, store.etcdKeyPrefix+string(directoryPrefix), clientv3.WithPrefix()); err != nil {
 		return fmt.Errorf("deleteFolderChildren %s : %v", fullpath, err)
 	}
 
@@ -141,26 +179,20 @@ func (store *EtcdStore) DeleteFolderChildren(ctx context.Context, fullpath weed_
 }
 
 func (store *EtcdStore) ListDirectoryPrefixedEntries(ctx context.Context, dirPath weed_util.FullPath, startFileName string, includeStartFile bool, limit int64, prefix string, eachEntryFunc filer.ListEachEntryFunc) (lastFileName string, err error) {
-	return lastFileName, filer.ErrUnsupportedListDirectoryPrefixed
-}
-
-func (store *EtcdStore) ListDirectoryEntries(ctx context.Context, dirPath weed_util.FullPath, startFileName string, includeStartFile bool, limit int64, eachEntryFunc filer.ListEachEntryFunc) (lastFileName string, err error) {
-	directoryPrefix := genDirectoryKeyPrefix(dirPath, "")
+	directoryPrefix := genDirectoryKeyPrefix(dirPath, prefix)
 	lastFileStart := directoryPrefix
-	if startFileName != "" {
+	if startFileName > prefix {
 		lastFileStart = genDirectoryKeyPrefix(dirPath, startFileName)
 	}
 
-	resp, err := store.client.Get(ctx, string(lastFileStart),
-		clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortDescend))
+	resp, err := store.client.Get(ctx, store.etcdKeyPrefix+string(lastFileStart),
+		clientv3.WithRange(clientv3.GetPrefixRangeEnd(store.etcdKeyPrefix+string(directoryPrefix))),
+		clientv3.WithLimit(limit+1))
 	if err != nil {
 		return lastFileName, fmt.Errorf("list %s : %v", dirPath, err)
 	}
 
 	for _, kv := range resp.Kvs {
-		if !bytes.HasPrefix(kv.Key, directoryPrefix) {
-			break
-		}
 		fileName := getNameFromKey(kv.Key)
 		if fileName == "" {
 			continue
@@ -177,16 +209,28 @@ func (store *EtcdStore) ListDirectoryEntries(ctx context.Context, dirPath weed_u
 		}
 		if decodeErr := entry.DecodeAttributesAndChunks(weed_util.MaybeDecompressData(kv.Value)); decodeErr != nil {
 			err = decodeErr
-			glog.V(0).Infof("list %s : %v", entry.FullPath, err)
+			glog.V(0).InfofCtx(ctx, "list %s : %v", entry.FullPath, err)
 			break
 		}
-		if !eachEntryFunc(entry) {
+
+		resEachEntryFunc, resEachEntryFuncErr := eachEntryFunc(entry)
+		if resEachEntryFuncErr != nil {
+			err = fmt.Errorf("failed to process eachEntryFunc: %w", resEachEntryFuncErr)
 			break
 		}
+
+		if !resEachEntryFunc {
+			break
+		}
+
 		lastFileName = fileName
 	}
 
 	return lastFileName, err
+}
+
+func (store *EtcdStore) ListDirectoryEntries(ctx context.Context, dirPath weed_util.FullPath, startFileName string, includeStartFile bool, limit int64, eachEntryFunc filer.ListEachEntryFunc) (lastFileName string, err error) {
+	return store.ListDirectoryPrefixedEntries(ctx, dirPath, startFileName, includeStartFile, limit, "", eachEntryFunc)
 }
 
 func genKey(dirPath, fileName string) (key []byte) {
